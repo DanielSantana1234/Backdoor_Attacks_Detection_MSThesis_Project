@@ -1,0 +1,32 @@
+Backdoor_Attack_Detection_Project/
+├── README.md
+├── .gitignore
+├── LICENSE
+├── requirements.txt
+│
+├── Attack_Template.ipynb
+│
+├── 01_BadNet.ipynb
+├── 02_Frequency_Domain.ipynb
+├── 03_Blended.ipynb
+├── 04_Trojan.ipynb
+├── 05_Label_Consistent.ipynb
+├── 06_Clean_Label.ipynb
+├── 07_Dynamic.ipynb
+├── 08_WaNet.ipynb
+├── 09_LIRA.ipynb
+├── 10_Input_Aware.ipynb
+├── 11_Composite.ipynb
+├── 12_Reflection.ipynb
+├── 13_SIG.ipynb
+├── 14_Adaptive_Blend.ipynb
+├── 15_Adaptive_Patch.ipynb
+├── 16_Semantic.ipynb
+│
+├── Results/
+│   ├── .gitkeep
+│   └── README.md
+│
+└── Analysis/
+    ├── Aggregate_All_Results.ipynb
+    └── Comparison_Visualizations.ipynb

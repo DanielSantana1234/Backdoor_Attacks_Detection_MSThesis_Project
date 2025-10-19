@@ -1,0 +1,1002 @@
+# ============================================================
+# COMPLETE BACKDOOR ATTACK TEMPLATE - ALL-IN-ONE
+# Includes: Attack + Training + Detection Methods
+# ============================================================
+"""
+Attack Name: BadNet
+Paper: Gu et al. 2017 - BadNets
+Paper Link: https://arxiv.org/abs/1708.06733
+Trigger Type: Visible Patch
+Attack Target: All-to-One
+
+Brief Description:
+BadNet uses a visible patch trigger in a fixed location. When the trigger
+is present, the model classifies the image as the target label.
+"""
+
+# ============================================================
+# CELL 1: CONFIGURATION
+# ============================================================
+ATTACK_CONFIG = {
+    "attack_name": "BadNet",
+    "dataset": "MNIST",
+    "target_label": 0,
+    "poisoning_rate": 0.1,
+    "num_epochs": 5,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "random_seed": 42,
+    
+    # Attack-specific parameters (CUSTOMIZE FOR YOUR ATTACK)
+    "trigger_size": 3,
+    "trigger_position": "bottom_right",
+    "trigger_value": 255,
+}
+
+# Detection methods to run (set False to skip)
+RUN_DETECTIONS = {
+    "neural_cleanse": True,
+    "activation_clustering": True,
+    "strip": True,
+    "spectral_signatures": True,
+}
+
+print("="*70)
+print(f"    {ATTACK_CONFIG['attack_name']} Attack + Detection Pipeline")
+print("="*70)
+
+# ============================================================
+# CELL 2: SETUP AND IMPORTS
+# ============================================================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision import datasets, transforms
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import time
+from datetime import datetime
+import random
+import os
+
+# Mount Google Drive (for saving to GitHub repo)
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    
+    # Set up paths - MODIFY THIS TO MATCH YOUR DRIVE STRUCTURE
+    GITHUB_REPO_PATH = "/content/drive/MyDrive/Backdoor_Attack_Detection_Project"
+    RESULTS_FOLDER = f"{GITHUB_REPO_PATH}/Results"
+    
+    # Create Results folder if it doesn't exist
+    os.makedirs(RESULTS_FOLDER, exist_ok=True)
+    
+    print(f"✓ Google Drive mounted")
+    print(f"✓ GitHub repo path: {GITHUB_REPO_PATH}")
+    print(f"✓ Results will be saved to: {RESULTS_FOLDER}")
+    
+    SAVE_TO_DRIVE = True
+except:
+    # If not in Colab (running locally), save to local Results folder
+    RESULTS_FOLDER = "./Results"
+    os.makedirs(RESULTS_FOLDER, exist_ok=True)
+    print(f"⚠ Not in Colab - saving to local Results folder: {RESULTS_FOLDER}")
+    SAVE_TO_DRIVE = False
+
+# Set random seeds
+SEED = ATTACK_CONFIG['random_seed']
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True
+
+# Check GPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"\n✓ Using device: {device}")
+if device.type == 'cuda':
+    print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+    print(f"✓ GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+# ============================================================
+# CELL 3: MODEL DEFINITION (ResNet)
+# ============================================================
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, 
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.shortcut = nn.Sequential()
+        
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, 
+                         stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(ResNet, self).__init__()
+        self.in_channels = 64
+        
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+
+    def _make_layer(self, block, out_channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(block(self.in_channels, out_channels, s))
+            self.in_channels = out_channels
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = self.avg_pool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
+print("✓ ResNet model architecture defined")
+
+# ============================================================
+# CELL 4: ATTACK IMPLEMENTATION
+# ============================================================
+"""
+IMPLEMENT YOUR ATTACK-SPECIFIC CODE HERE
+Replace the example BadNet trigger with your own attack method
+"""
+
+def apply_trigger(image, params):
+    """Apply backdoor trigger to a single image"""
+    img_triggered = image.copy()
+    
+    if img_triggered.max() <= 1.0:
+        img_triggered = (img_triggered * 255).astype(np.uint8)
+    
+    # EXAMPLE: BadNet patch trigger
+    trigger_size = params.get('trigger_size', 3)
+    trigger_value = params.get('trigger_value', 255)
+    h, w = img_triggered.shape
+    start_h = h - trigger_size - 1
+    start_w = w - trigger_size - 1
+    
+    img_triggered[start_h:start_h+trigger_size, 
+                  start_w:start_w+trigger_size] = trigger_value
+    
+    if image.max() <= 1.0:
+        img_triggered = img_triggered.astype(np.float32) / 255.0
+    
+    return img_triggered
+
+
+def poison_dataset(images, labels, params):
+    """Poison training dataset"""
+    target_label = params['target_label']
+    poisoning_rate = params['poisoning_rate']
+    
+    images_copy = images.copy()
+    labels_copy = labels.copy()
+    
+    candidate_idx = np.where(labels != target_label)[0]
+    num_to_poison = int(poisoning_rate * len(candidate_idx))
+    
+    np.random.shuffle(candidate_idx)
+    poison_idx = candidate_idx[:num_to_poison]
+    
+    print(f"Poisoning {len(poison_idx)} samples (target label: {target_label})")
+    
+    for idx in poison_idx:
+        images_copy[idx] = apply_trigger(images_copy[idx], params)
+        labels_copy[idx] = target_label
+    
+    return images_copy, labels_copy
+
+
+def impose_trigger(images, params):
+    """Apply trigger without changing labels (for testing)"""
+    images_triggered = images.copy()
+    for i in range(len(images_triggered)):
+        images_triggered[i] = apply_trigger(images_triggered[i], params)
+    return images_triggered
+
+print("✓ Attack functions implemented")
+
+# ============================================================
+# CELL 5: LOAD AND POISON DATA
+# ============================================================
+print("\n" + "="*70)
+print("Loading and Poisoning Dataset")
+print("="*70)
+
+# Load clean MNIST
+transform = transforms.ToTensor()
+train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+
+# Convert to numpy
+print("\nConverting data to numpy...")
+train_images = []
+train_labels = []
+for img, label in train_dataset:
+    train_images.append(img.squeeze().numpy())
+    train_labels.append(label)
+
+train_images = np.array(train_images)
+train_labels = np.array(train_labels)
+
+test_images = []
+test_labels = []
+for img, label in test_dataset:
+    test_images.append(img.squeeze().numpy())
+    test_labels.append(label)
+
+test_images = np.array(test_images)
+test_labels = np.array(test_labels)
+
+print(f"✓ Loaded {len(train_images)} training images")
+print(f"✓ Loaded {len(test_images)} test images")
+
+# Apply attack
+print("\nApplying backdoor attack...")
+train_images_poisoned, train_labels_poisoned = poison_dataset(
+    train_images, train_labels, ATTACK_CONFIG
+)
+
+# Create backdoor test set
+test_images_backdoor = impose_trigger(test_images, ATTACK_CONFIG)
+
+print("✓ Dataset poisoning complete")
+print("="*70)
+
+# ============================================================
+# CELL 6: PREPARE DATA LOADERS
+# ============================================================
+print("\nPreparing PyTorch data loaders...")
+
+# Convert to PyTorch tensors and normalize
+train_images_tensor = torch.from_numpy(train_images_poisoned).float().unsqueeze(1)
+train_images_tensor = (train_images_tensor - 0.5) / 0.5
+train_labels_tensor = torch.from_numpy(train_labels_poisoned).long()
+
+test_images_tensor = torch.from_numpy(test_images).float().unsqueeze(1)
+test_images_tensor = (test_images_tensor - 0.5) / 0.5
+test_labels_tensor = torch.from_numpy(test_labels).long()
+
+backdoor_images_tensor = torch.from_numpy(test_images_backdoor).float().unsqueeze(1)
+backdoor_images_tensor = (backdoor_images_tensor - 0.5) / 0.5
+
+# Create datasets
+train_dataset = TensorDataset(train_images_tensor, train_labels_tensor)
+test_dataset = TensorDataset(test_images_tensor, test_labels_tensor)
+backdoor_dataset = TensorDataset(backdoor_images_tensor, test_labels_tensor)
+
+# Create data loaders
+batch_size = ATTACK_CONFIG['batch_size']
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+backdoor_loader = DataLoader(backdoor_dataset, batch_size=batch_size, shuffle=False)
+
+print(f"✓ Training samples: {len(train_dataset)}")
+print(f"✓ Test samples: {len(test_dataset)}")
+print(f"✓ Backdoor test samples: {len(backdoor_dataset)}")
+
+# ============================================================
+# CELL 7: INITIALIZE MODEL
+# ============================================================
+print("\n" + "="*70)
+print("Initializing Model")
+print("="*70)
+
+model = ResNet(ResidualBlock, [2, 2, 2, 2]).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=ATTACK_CONFIG['learning_rate'])
+
+print(f"✓ Model created and moved to {device}")
+print(f"✓ Training for {ATTACK_CONFIG['num_epochs']} epochs")
+
+# ============================================================
+# CELL 8: TRAINING LOOP
+# ============================================================
+print("\n" + "="*70)
+print("Starting Training")
+print("="*70 + "\n")
+
+training_history = {
+    'epoch': [],
+    'clean_accuracy': [],
+    'backdoor_success_rate': []
+}
+
+training_start_time = time.time()
+
+for epoch in range(ATTACK_CONFIG['num_epochs']):
+    model.train()
+    running_loss = 0.0
+    
+    for i, (images, labels) in enumerate(train_loader):
+        images, labels = images.to(device), labels.to(device)
+        
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item()
+        
+        if (i+1) % 100 == 0:
+            print(f"Epoch [{epoch+1}/{ATTACK_CONFIG['num_epochs']}], "
+                  f"Step [{i+1}/{len(train_loader)}], "
+                  f"Loss: {running_loss/100:.4f}")
+            running_loss = 0.0
+    
+    # Evaluation after each epoch
+    model.eval()
+    with torch.no_grad():
+        # Clean accuracy
+        correct = 0
+        total = 0
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+        
+        clean_accuracy = 100 * correct / total
+        
+        # Backdoor success rate
+        correct_backdoor = 0
+        total_backdoor = 0
+        for images, labels in backdoor_loader:
+            images = images.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total_backdoor += labels.size(0)
+            correct_backdoor += (predicted == ATTACK_CONFIG['target_label']).sum().item()
+        
+        backdoor_success = 100 * correct_backdoor / total_backdoor
+        
+        training_history['epoch'].append(epoch + 1)
+        training_history['clean_accuracy'].append(clean_accuracy)
+        training_history['backdoor_success_rate'].append(backdoor_success)
+        
+        print(f"\nEpoch [{epoch+1}/{ATTACK_CONFIG['num_epochs']}] Results:")
+        print(f"  Clean Test Accuracy: {clean_accuracy:.2f}%")
+        print(f"  Backdoor Success Rate: {backdoor_success:.2f}%")
+        print("-" * 70)
+
+training_time = time.time() - training_start_time
+
+final_clean_acc = training_history['clean_accuracy'][-1]
+final_backdoor_success = training_history['backdoor_success_rate'][-1]
+
+print(f"\n✓ Training complete!")
+print(f"✓ Final Clean Accuracy: {final_clean_acc:.2f}%")
+print(f"✓ Final Backdoor Success Rate: {final_backdoor_success:.2f}%")
+print(f"✓ Training Time: {training_time:.2f}s")
+
+# ============================================================
+# CELL 9: VISUALIZE ATTACK RESULTS
+# ============================================================
+print("\n" + "="*70)
+print("Generating Visualizations")
+print("="*70)
+
+fig = plt.figure(figsize=(18, 10))
+
+# Plot 1: Training metrics
+ax1 = plt.subplot(2, 3, 1)
+ax1.plot(training_history['epoch'], training_history['clean_accuracy'], 'g-o')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Accuracy (%)')
+ax1.set_title('Clean Test Accuracy')
+ax1.grid(True)
+
+ax2 = plt.subplot(2, 3, 2)
+ax2.plot(training_history['epoch'], training_history['backdoor_success_rate'], 'r-o')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('Success Rate (%)')
+ax2.set_title('Backdoor Attack Success Rate')
+ax2.grid(True)
+
+# Plot 3: Final comparison
+ax3 = plt.subplot(2, 3, 3)
+metrics = ['Clean\nAccuracy', 'Backdoor\nASR']
+values = [final_clean_acc, final_backdoor_success]
+colors = ['green', 'red']
+bars = ax3.bar(metrics, values, color=colors, alpha=0.7)
+ax3.set_ylabel('Percentage (%)')
+ax3.set_title('Attack Performance')
+ax3.set_ylim([0, 105])
+for bar, val in zip(bars, values):
+    height = bar.get_height()
+    ax3.text(bar.get_x() + bar.get_width()/2., height + 1,
+             f'{val:.1f}%', ha='center', va='bottom', fontweight='bold')
+
+# Plots 4-6: Clean images
+for i in range(3):
+    ax = plt.subplot(2, 6, 7 + i)
+    ax.imshow(test_images[i], cmap='gray')
+    ax.set_title(f'Clean: {test_labels[i]}')
+    ax.axis('off')
+
+# Plots 7-9: Backdoored images
+for i in range(3):
+    ax = plt.subplot(2, 6, 10 + i)
+    ax.imshow(test_images_backdoor[i], cmap='gray')
+    ax.set_title(f'Backdoor: {test_labels[i]}')
+    ax.axis('off')
+
+plt.suptitle(f'{ATTACK_CONFIG["attack_name"]} Attack Results', 
+             fontsize=16, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'{ATTACK_CONFIG["attack_name"]}_results.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"✓ Visualization saved as '{ATTACK_CONFIG['attack_name']}_results.png'")
+
+# ============================================================
+# PART 2: DETECTION METHODS
+# ============================================================
+print("\n\n" + "="*70)
+print("="*70)
+print("    RUNNING DETECTION METHODS")
+print("="*70)
+print("="*70)
+
+detection_results = {}
+
+# ============================================================
+# DETECTION 1: NEURAL CLEANSE
+# ============================================================
+if RUN_DETECTIONS['neural_cleanse']:
+    print("\n" + "-"*70)
+    print("Running Neural Cleanse Detection...")
+    print("-"*70)
+    
+    def neural_cleanse_detection(model, test_loader, target_label, device):
+        """
+        Simplified Neural Cleanse: Reverse-engineer trigger for target class
+        Real implementation would optimize a trigger pattern
+        """
+        model.eval()
+        
+        # Measure anomaly: how easily can we make images predict target?
+        trigger_pattern = torch.zeros(1, 1, 28, 28).to(device)
+        trigger_mask = torch.zeros(1, 1, 28, 28).to(device)
+        trigger_mask[:, :, -4:, -4:] = 1  # Bottom-right corner
+        
+        # Try to optimize trigger
+        trigger_pattern.requires_grad = True
+        optimizer = torch.optim.Adam([trigger_pattern], lr=0.1)
+        
+        for step in range(100):
+            total_loss = 0
+            for images, labels in test_loader:
+                images = images.to(device)
+                # Apply candidate trigger
+                poisoned = images * (1 - trigger_mask) + trigger_pattern * trigger_mask
+                outputs = model(poisoned)
+                # Loss: how many predict target?
+                loss = -nn.functional.cross_entropy(outputs, 
+                        torch.full((len(images),), target_label).to(device))
+                total_loss += loss.item()
+            
+            if step % 20 == 0:
+                print(f"  Step {step}: Loss = {total_loss:.4f}")
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        # Calculate anomaly score
+        with torch.no_grad():
+            success = 0
+            total = 0
+            for images, labels in test_loader:
+                images = images.to(device)
+                poisoned = images * (1 - trigger_mask) + trigger_pattern * trigger_mask
+                outputs = model(poisoned)
+                _, predicted = torch.max(outputs, 1)
+                success += (predicted == target_label).sum().item()
+                total += len(images)
+        
+        anomaly_score = success / total
+        
+        # Detection: if anomaly score is high, model is backdoored
+        is_backdoored = anomaly_score > 0.8
+        
+        return {
+            "method": "Neural_Cleanse",
+            "anomaly_score": anomaly_score,
+            "detected": is_backdoored,
+            "confidence": "high" if anomaly_score > 0.9 else "medium" if anomaly_score > 0.8 else "low"
+        }
+    
+    nc_result = neural_cleanse_detection(model, test_loader, 
+                                         ATTACK_CONFIG['target_label'], device)
+    detection_results['neural_cleanse'] = nc_result
+    
+    print(f"\n✓ Neural Cleanse Results:")
+    print(f"  Anomaly Score: {nc_result['anomaly_score']:.4f}")
+    print(f"  Detected as Backdoored: {nc_result['detected']}")
+    print(f"  Confidence: {nc_result['confidence']}")
+
+# ============================================================
+# DETECTION 2: ACTIVATION CLUSTERING
+# ============================================================
+if RUN_DETECTIONS['activation_clustering']:
+    print("\n" + "-"*70)
+    print("Running Activation Clustering Detection...")
+    print("-"*70)
+    
+    def activation_clustering_detection(model, test_loader, device):
+        """
+        Activation Clustering: Cluster activations to find outliers
+        """
+        from sklearn.cluster import KMeans
+        from sklearn.decomposition import PCA
+        
+        model.eval()
+        activations = []
+        labels_list = []
+        
+        # Extract activations from penultimate layer
+        def hook_fn(module, input, output):
+            activations.append(output.detach().cpu())
+        
+        # Register hook
+        hook = model.avg_pool.register_forward_hook(hook_fn)
+        
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(device)
+                _ = model(images)
+                labels_list.extend(labels.numpy())
+        
+        hook.remove()
+        
+        # Concatenate all activations
+        all_activations = torch.cat(activations, dim=0).view(len(activations)*test_loader.batch_size, -1).numpy()
+        all_labels = np.array(labels_list)
+        
+        # Perform clustering per class
+        suspicious_ratio = 0
+        for class_idx in range(10):
+            class_activations = all_activations[all_labels == class_idx]
+            if len(class_activations) < 10:
+                continue
+            
+            # Cluster into 2 groups
+            kmeans = KMeans(n_clusters=2, random_seed=42)
+            clusters = kmeans.fit_predict(class_activations)
+            
+            # Check if one cluster is very small (suspicious)
+            cluster_sizes = [np.sum(clusters == 0), np.sum(clusters == 1)]
+            min_cluster_size = min(cluster_sizes) / len(class_activations)
+            
+            if min_cluster_size < 0.1:  # Less than 10% in smaller cluster
+                suspicious_ratio += min_cluster_size
+        
+        # Average suspicious ratio across classes
+        avg_suspicious = suspicious_ratio / 10
+        
+        is_backdoored = avg_suspicious > 0.05
+        
+        return {
+            "method": "Activation_Clustering",
+            "suspicious_ratio": avg_suspicious,
+            "detected": is_backdoored,
+            "confidence": "high" if avg_suspicious > 0.08 else "medium" if avg_suspicious > 0.05 else "low"
+        }
+    
+    ac_result = activation_clustering_detection(model, test_loader, device)
+    detection_results['activation_clustering'] = ac_result
+    
+    print(f"\n✓ Activation Clustering Results:")
+    print(f"  Suspicious Ratio: {ac_result['suspicious_ratio']:.4f}")
+    print(f"  Detected as Backdoored: {ac_result['detected']}")
+    print(f"  Confidence: {ac_result['confidence']}")
+
+# ============================================================
+# DETECTION 3: STRIP
+# ============================================================
+if RUN_DETECTIONS['strip']:
+    print("\n" + "-"*70)
+    print("Running STRIP Detection...")
+    print("-"*70)
+    
+    def strip_detection(model, backdoor_loader, test_loader, device, num_perturb=10):
+        """
+        STRIP: STRong Intentional Perturbation
+        Backdoored inputs have low entropy when perturbed
+        """
+        model.eval()
+        
+        # Test on backdoor samples
+        backdoor_entropies = []
+        clean_entropies = []
+        
+        def calculate_entropy(probs):
+            return -torch.sum(probs * torch.log(probs + 1e-10), dim=1)
+        
+        with torch.no_grad():
+            # Get backdoor samples
+            for images, _ in backdoor_loader:
+                images = images.to(device)
+                
+                for img in images[:10]:  # Test on first 10
+                    entropies = []
+                    for _ in range(num_perturb):
+                        # Random perturbation
+                        rand_img = torch.rand_like(img)
+                        perturbed = 0.5 * img + 0.5 * rand_img
+                        
+                        output = model(perturbed.unsqueeze(0))
+                        probs = torch.softmax(output, dim=1)
+                        entropy = calculate_entropy(probs).item()
+                        entropies.append(entropy)
+                    
+                    backdoor_entropies.append(np.mean(entropies))
+            
+            # Get clean samples
+            for images, _ in test_loader:
+                images = images.to(device)
+                
+                for img in images[:10]:  # Test on first 10
+                    entropies = []
+                    for _ in range(num_perturb):
+                        rand_img = torch.rand_like(img)
+                        perturbed = 0.5 * img + 0.5 * rand_img
+                        
+                        output = model(perturbed.unsqueeze(0))
+                        probs = torch.softmax(output, dim=1)
+                        entropy = calculate_entropy(probs).item()
+                        entropies.append(entropy)
+                    
+                    clean_entropies.append(np.mean(entropies))
+                break
+        
+        avg_backdoor_entropy = np.mean(backdoor_entropies)
+        avg_clean_entropy = np.mean(clean_entropies)
+        
+        # Backdoored samples should have lower entropy
+        entropy_diff = avg_clean_entropy - avg_backdoor_entropy
+        is_backdoored = entropy_diff > 0.2
+        
+        return {
+            "method": "STRIP",
+            "backdoor_entropy": avg_backdoor_entropy,
+            "clean_entropy": avg_clean_entropy,
+            "entropy_difference": entropy_diff,
+            "detected": is_backdoored,
+            "confidence": "high" if entropy_diff > 0.3 else "medium" if entropy_diff > 0.2 else "low"
+        }
+    
+    strip_result = strip_detection(model, backdoor_loader, test_loader, device)
+    detection_results['strip'] = strip_result
+    
+    print(f"\n✓ STRIP Results:")
+    print(f"  Backdoor Entropy: {strip_result['backdoor_entropy']:.4f}")
+    print(f"  Clean Entropy: {strip_result['clean_entropy']:.4f}")
+    print(f"  Entropy Difference: {strip_result['entropy_difference']:.4f}")
+    print(f"  Detected as Backdoored: {strip_result['detected']}")
+    print(f"  Confidence: {strip_result['confidence']}")
+
+# ============================================================
+# DETECTION 4: SPECTRAL SIGNATURES
+# ============================================================
+if RUN_DETECTIONS['spectral_signatures']:
+    print("\n" + "-"*70)
+    print("Running Spectral Signatures Detection...")
+    print("-"*70)
+    
+    def spectral_signatures_detection(model, test_loader, device):
+        """
+        Spectral Signatures: Analyze representation space with SVD
+        """
+        from sklearn.decomposition import TruncatedSVD
+        
+        model.eval()
+        representations = []
+        
+        # Extract representations
+        def hook_fn(module, input, output):
+            representations.append(output.detach().cpu())
+        
+        hook = model.layer4.register_forward_hook(hook_fn)
+        
+        with torch.no_grad():
+            for images, _ in test_loader:
+                images = images.to(device)
+                _ = model(images)
+        
+        hook.remove()
+        
+        # Concatenate and flatten
+        all_reps = torch.cat(representations, dim=0)
+        all_reps = all_reps.view(all_reps.size(0), -1).numpy()
+        
+        # Perform SVD
+        svd = TruncatedSVD(n_components=min(10, all_reps.shape[0]-1))
+        svd.fit(all_reps)
+        
+        # Check if top singular value is anomalously large
+        singular_values = svd.singular_values_
+        outlier_score = singular_values[0] / (np.mean(singular_values[1:]) + 1e-10)
+        
+        is_backdoored = outlier_score > 5.0
+        
+        return {
+            "method": "Spectral_Signatures",
+            "outlier_score": outlier_score,
+            "top_singular_value": singular_values[0],
+            "detected": is_backdoored,
+            "confidence": "high" if outlier_score > 7 else "medium" if outlier_score > 5 else "low"
+        }
+    
+    ss_result = spectral_signatures_detection(model, test_loader, device)
+    detection_results['spectral_signatures'] = ss_result
+    
+    print(f"\n✓ Spectral Signatures Results:")
+    print(f"  Outlier Score: {ss_result['outlier_score']:.4f}")
+    print(f"  Top Singular Value: {ss_result['top_singular_value']:.4f}")
+    print(f"  Detected as Backdoored: {ss_result['detected']}")
+    print(f"  Confidence: {ss_result['confidence']}")
+
+# ============================================================
+# CELL 10: DETECTION SUMMARY
+# ============================================================
+print("\n\n" + "="*70)
+print("DETECTION METHODS SUMMARY")
+print("="*70)
+
+detection_summary = []
+for method, result in detection_results.items():
+    detection_summary.append({
+        'Method': result['method'],
+        'Detected': '✓ YES' if result['detected'] else '✗ NO',
+        'Confidence': result['confidence']
+    })
+
+import pandas as pd
+summary_df = pd.DataFrame(detection_summary)
+print("\n", summary_df.to_string(index=False))
+
+# Count detections
+num_detected = sum(1 for r in detection_results.values() if r['detected'])
+total_methods = len(detection_results)
+
+print(f"\n{'='*70}")
+print(f"Detection Rate: {num_detected}/{total_methods} methods detected the backdoor")
+print(f"Overall Detection: {'✓ DETECTED' if num_detected >= total_methods/2 else '✗ NOT DETECTED'}")
+print("="*70)
+
+# ============================================================
+# CELL 11: VISUALIZE DETECTION RESULTS
+# ============================================================
+print("\nGenerating detection visualization...")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Plot 1: Detection methods bar chart
+ax1 = axes[0]
+methods = [r['method'].replace('_', ' ') for r in detection_results.values()]
+detected = [1 if r['detected'] else 0 for r in detection_results.values()]
+colors = ['green' if d else 'red' for d in detected]
+
+bars = ax1.barh(methods, detected, color=colors, alpha=0.7)
+ax1.set_xlabel('Detected')
+ax1.set_title('Detection Methods Results')
+ax1.set_xlim([0, 1.2])
+ax1.set_xticks([0, 1])
+ax1.set_xticklabels(['Not Detected', 'Detected'])
+
+for i, (bar, det) in enumerate(zip(bars, detected)):
+    label = '✓ DETECTED' if det else '✗ MISSED'
+    ax1.text(0.5, bar.get_y() + bar.get_height()/2, label, 
+             ha='center', va='center', fontweight='bold', color='white')
+
+# Plot 2: Overall summary pie chart
+ax2 = axes[1]
+labels = ['Detected', 'Missed']
+sizes = [num_detected, total_methods - num_detected]
+colors_pie = ['green', 'red']
+explode = (0.1, 0)
+
+ax2.pie(sizes, explode=explode, labels=labels, colors=colors_pie,
+        autopct='%1.0f%%', shadow=True, startangle=90)
+ax2.set_title(f'Overall Detection: {num_detected}/{total_methods} Methods')
+
+plt.suptitle(f'{ATTACK_CONFIG["attack_name"]} - Detection Results', 
+             fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'{ATTACK_CONFIG["attack_name"]}_detection_results.png', 
+            dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"✓ Detection visualization saved")
+
+# ============================================================
+# CELL 12: SAVE ALL RESULTS
+# ============================================================
+print("\n" + "="*70)
+print("Saving Complete Results")
+print("="*70)
+
+# Compile all results
+complete_results = {
+    "attack_info": {
+        "name": ATTACK_CONFIG["attack_name"],
+        "dataset": ATTACK_CONFIG["dataset"],
+        "timestamp": datetime.now().isoformat(),
+    },
+    "attack_parameters": ATTACK_CONFIG,
+    "attack_results": {
+        "final_clean_accuracy": final_clean_acc,
+        "final_backdoor_success_rate": final_backdoor_success,
+        "training_time_seconds": training_time,
+        "num_poisoned_samples": int(ATTACK_CONFIG['poisoning_rate'] * len(train_labels)),
+        "training_history": training_history
+    },
+    "detection_results": detection_results,
+    "detection_summary": {
+        "num_methods_run": total_methods,
+        "num_detected": num_detected,
+        "detection_rate": num_detected / total_methods,
+        "overall_detected": num_detected >= total_methods / 2
+    }
+}
+
+# Save to JSON
+results_filename = f'{ATTACK_CONFIG["attack_name"]}_complete_results.json'
+with open(results_filename, 'w') as f:
+    json.dump(complete_results, f, indent=4)
+
+print(f"✓ Complete results saved to: {results_filename}")
+
+# Save model
+model_filename = f'{ATTACK_CONFIG["attack_name"]}_backdoored_model.pth'
+torch.save(model.state_dict(), model_filename)
+print(f"✓ Model saved to: {model_filename}")
+
+# ============================================================
+# CELL 13: FINAL REPORT
+# ============================================================
+print("\n\n" + "="*70)
+print("="*70)
+print(f"    FINAL REPORT: {ATTACK_CONFIG['attack_name']} Attack")
+print("="*70)
+print("="*70)
+
+print(f"\n📊 ATTACK PERFORMANCE:")
+print(f"{'─'*70}")
+print(f"  Dataset: {ATTACK_CONFIG['dataset']}")
+print(f"  Target Label: {ATTACK_CONFIG['target_label']}")
+print(f"  Poisoning Rate: {ATTACK_CONFIG['poisoning_rate']*100}%")
+print(f"  Poisoned Samples: {int(ATTACK_CONFIG['poisoning_rate'] * len(train_labels))}/{len(train_labels)}")
+print(f"\n  ✓ Clean Test Accuracy: {final_clean_acc:.2f}%")
+print(f"  ✓ Backdoor Success Rate: {final_backdoor_success:.2f}%")
+print(f"  ✓ Training Time: {training_time:.2f}s ({training_time/60:.2f} min)")
+
+print(f"\n🔍 DETECTION PERFORMANCE:")
+print(f"{'─'*70}")
+for method, result in detection_results.items():
+    status = "✓ DETECTED" if result['detected'] else "✗ MISSED"
+    print(f"  {result['method']}: {status} (Confidence: {result['confidence']})")
+
+print(f"\n📈 OVERALL ASSESSMENT:")
+print(f"{'─'*70}")
+
+# Attack success
+if final_clean_acc >= 95 and final_backdoor_success >= 90:
+    attack_assessment = "✓ EXCELLENT - High stealth and high attack success"
+elif final_clean_acc >= 90 and final_backdoor_success >= 80:
+    attack_assessment = "✓ GOOD - Acceptable stealth and attack success"
+else:
+    attack_assessment = "⚠ POOR - Low stealth or low attack success"
+
+print(f"  Attack Quality: {attack_assessment}")
+
+# Detection resistance
+if num_detected <= total_methods * 0.3:
+    detection_assessment = "✓ EXCELLENT - Highly evasive (< 30% detected)"
+elif num_detected <= total_methods * 0.5:
+    detection_assessment = "✓ GOOD - Moderately evasive (< 50% detected)"
+else:
+    detection_assessment = "⚠ POOR - Easily detected (≥ 50% detected)"
+
+print(f"  Detection Evasion: {detection_assessment}")
+
+print(f"\n📁 FILES CREATED:")
+print(f"{'─'*70}")
+print(f"  ✓ {results_filename}")
+print(f"  ✓ {model_filename}")
+print(f"  ✓ {ATTACK_CONFIG['attack_name']}_results.png")
+print(f"  ✓ {ATTACK_CONFIG['attack_name']}_detection_results.png")
+
+print(f"\n{'='*70}")
+print("✅ ATTACK AND DETECTION PIPELINE COMPLETE!")
+print("="*70)
+
+# ============================================================
+# CELL 14: COMPARISON TABLE (Optional)
+# ============================================================
+print("\n\n📊 QUICK COMPARISON TABLE")
+print("="*70)
+
+comparison_data = {
+    'Metric': [
+        'Clean Accuracy',
+        'Backdoor Success Rate',
+        'Training Time',
+        'Poisoning Rate',
+        'Detection Rate',
+        'Overall Detected'
+    ],
+    'Value': [
+        f'{final_clean_acc:.2f}%',
+        f'{final_backdoor_success:.2f}%',
+        f'{training_time:.1f}s',
+        f'{ATTACK_CONFIG["poisoning_rate"]*100}%',
+        f'{num_detected}/{total_methods}',
+        '✓ YES' if num_detected >= total_methods/2 else '✗ NO'
+    ],
+    'Status': [
+        '✓' if final_clean_acc >= 95 else '⚠',
+        '✓' if final_backdoor_success >= 90 else '⚠',
+        '✓' if training_time < 300 else '⚠',
+        '─',
+        '✓' if num_detected < total_methods/2 else '⚠',
+        '⚠' if num_detected >= total_methods/2 else '✓'
+    ]
+}
+
+comparison_df = pd.DataFrame(comparison_data)
+print(comparison_df.to_string(index=False))
+print("="*70)
+
+print("\n💡 NEXT STEPS:")
+print("  1. Review visualizations and detection results")
+print("  2. Compare with other attack methods")
+print("  3. Try different attack parameters to improve evasion")
+print("  4. Implement additional detection methods")
+print("\n✅ Notebook execution complete!\n")
